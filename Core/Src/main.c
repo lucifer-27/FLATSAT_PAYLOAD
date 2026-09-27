@@ -35,7 +35,7 @@ typedef enum
 {
     UART_STATE_WAIT_UTC,
     UART_STATE_WAIT_PROCESS_ACK,
-	UART_WAIT_SEND_IMG,
+    UART_WAIT_SEND_IMG,
     UART_STATE_DONE
 } UART_State_t;
 
@@ -43,12 +43,29 @@ typedef enum
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define CAPTURE_SIZE       9
-#define UTC_DATA_SIZE      21
-#define ACK_DATA_SIZE      13
-#define UTC_RESPONSE_DELAY 200
+#define CAPTURE_SIZE            9
+#define UTC_DATA_SIZE           21
+#define ACK_DATA_SIZE           13
+#define UTC_RESPONSE_DELAY      200
 
-#define PACKET_SIZE 210
+#define PACKET_SIZE             210
+
+/*
+ * RPi sends packet count as:
+ *
+ * COUNT00125
+ *
+ * This is exactly 10 bytes.
+ */
+#define PACKET_COUNT_DATA_SIZE  10
+
+/*
+ * Maximum number of packets accepted.
+ *
+ * 99999 packets is the maximum representable
+ * by COUNTxxxxx.
+ */
+#define MAX_PACKET_COUNT        99999
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -65,10 +82,17 @@ UART_HandleTypeDef huart3;
 UART_HandleTypeDef huart6;
 
 /* USER CODE BEGIN PV */
+/*
+ * SPI / SD variables
+ */
 uint8_t spi_tx;
 uint8_t spi_rx;
 uint8_t sd_buffer[512];
 
+
+/*
+ * FATFS variables
+ */
 FATFS image_fs;
 FIL image_file;
 
@@ -76,10 +100,26 @@ FRESULT sd_result;
 UINT bytes_written;
 UINT bytes_read;
 
+
+/*
+ * SD test string
+ */
 char sd_test_data[] = "STM32 SD TEST\r\n";
 
 
+/*
+ * SPI packet receive buffer.
+ *
+ * Complete packet:
+ *
+ * [0..1]     SYNC
+ * [2..5]     PACKET ID
+ * [6..7]     PAYLOAD LENGTH
+ * [8..9]     CRC
+ * [10..209]  PAYLOAD
+ */
 uint8_t spi2_rx_buffer[PACKET_SIZE];
+
 
 /*
  * Command sent from STM32 to Raspberry Pi.
@@ -94,11 +134,36 @@ uint8_t utc_data[UTC_DATA_SIZE];
 
 
 /*
- * Final acknowledgement received from Raspberry Pi.
+ * Process ACK received from Raspberry Pi.
  */
 uint8_t ack_data[ACK_DATA_SIZE];
 
-uint8_t snd_status[10];
+
+/*
+ * Packet count received from Raspberry Pi.
+ *
+ * Expected format:
+ *
+ * COUNT00125
+ *
+ * exactly 10 bytes.
+ */
+uint8_t packet_count_data[PACKET_COUNT_DATA_SIZE];
+
+
+/*
+ * Total number of packets in current image.
+ */
+volatile uint32_t total_packets = 0;
+
+
+/*
+ * Indicates that packet count was received
+ * and successfully decoded.
+ */
+volatile uint8_t packet_count_received = 0;
+
+
 /*
  * Current UART state.
  */
@@ -106,23 +171,23 @@ volatile UART_State_t uart_state = UART_STATE_WAIT_UTC;
 
 
 /*
- * Flag indicating that UTC data has been received.
+ * Flag indicating UTC data has been received.
  */
 volatile uint8_t utc_received = 0;
 
 
 /*
- * Flag indicating that final ACK has been received.
+ * Flag indicating final processing ACK
+ * has been received.
  */
 volatile uint8_t ack_received = 0;
 
-volatile uint8_t snd_ack_received = 0;
 
 /*
  * Time at which UTC reception completed.
  */
 volatile uint32_t utc_received_time = 0;
-//volatile uint32_t flag_to_delete = 0;
+
 
 /* USER CODE END PV */
 
@@ -137,79 +202,254 @@ static void MX_USART3_UART_Init(void);
 
 
 
+/* =========================================================
+ * CRC-16-CCITT
+ * ========================================================= */
+
+uint16_t crc16_ccitt(const uint8_t *data, uint32_t length);
+
+
+/* =========================================================
+ * UART RECEIVE CALLBACK
+ * ========================================================= */
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == USART6)
+    if (huart->Instance != USART6)
+    {
+        return;
+    }
+
+
+    /* =====================================================
+     * STATE 1:
+     * WAITING FOR UTC
+     * ===================================================== */
+
+    if (uart_state == UART_STATE_WAIT_UTC)
     {
         /*
-         * We are expecting the UTC folder name.
+         * UTC reception completed.
          */
-        if (uart_state == UART_STATE_WAIT_UTC)
+
+        utc_received = 1;
+
+
+        /*
+         * Echo UTC back to Raspberry Pi.
+         */
+        HAL_UART_Transmit(
+            &huart6,
+            utc_data,
+            UTC_DATA_SIZE,
+            HAL_MAX_DELAY
+        );
+
+
+        /*
+         * Next we expect process ACK.
+         */
+        uart_state = UART_STATE_WAIT_PROCESS_ACK;
+
+
+        /*
+         * Receive process ACK.
+         */
+        HAL_UART_Receive_IT(
+            &huart6,
+            ack_data,
+            ACK_DATA_SIZE
+        );
+
+
+        /*
+         * Store reception time.
+         */
+        utc_received_time = HAL_GetTick();
+    }
+
+
+    /* =====================================================
+     * STATE 2:
+     * WAITING FOR PROCESS ACK
+     * ===================================================== */
+
+    else if (uart_state == UART_STATE_WAIT_PROCESS_ACK)
+    {
+        /*
+         * Process ACK received.
+         */
+
+        ack_received = 1;
+
+
+        /*
+         * Next we expect packet count.
+         */
+        uart_state = UART_WAIT_SEND_IMG;
+
+
+        /*
+         * Raspberry Pi will send:
+         *
+         * COUNT00125
+         *
+         * exactly 10 bytes.
+         */
+        HAL_UART_Receive_IT(
+            &huart6,
+            packet_count_data,
+            PACKET_COUNT_DATA_SIZE
+        );
+    }
+
+
+    /* =====================================================
+     * STATE 3:
+     * WAITING FOR PACKET COUNT
+     * ===================================================== */
+
+    else if (uart_state == UART_WAIT_SEND_IMG)
+    {
+        /*
+         * Expected format:
+         *
+         * C O U N T 0 0 1 2 5
+         *
+         * Example:
+         *
+         * COUNT00125
+         */
+
+        total_packets = 0;
+
+
+        /*
+         * Verify "COUNT".
+         */
+        if (packet_count_data[0] != 'C' ||
+            packet_count_data[1] != 'O' ||
+            packet_count_data[2] != 'U' ||
+            packet_count_data[3] != 'N' ||
+            packet_count_data[4] != 'T')
         {
             /*
-             * Tell the main loop that UTC reception is complete.
+             * Invalid packet-count header.
              */
-            utc_received = 1;
-            HAL_UART_Transmit(&huart6,
-                                  utc_data,
-                                  UTC_DATA_SIZE,
-                                  HAL_MAX_DELAY);
-            uart_state = UART_STATE_WAIT_PROCESS_ACK;
 
-            HAL_UART_Receive_IT(&huart6,
-                                   ack_data,
-                                   ACK_DATA_SIZE);
-            /*
-             * Store the time at which UTC was received.
-             */
-            utc_received_time = HAL_GetTick();
+            total_packets = 0;
+            packet_count_received = 0;
+
+            HAL_UART_Receive_IT(
+                &huart6,
+                packet_count_data,
+                PACKET_COUNT_DATA_SIZE
+            );
+
+            return;
         }
 
 
         /*
-         * We are expecting the final process ACK.
+         * Decode five decimal digits.
+         *
+         * COUNT00001 = 1
+         * COUNT00125 = 125
+         * COUNT10000 = 10000
          */
-        else if (uart_state == UART_STATE_WAIT_PROCESS_ACK)
+        for (uint8_t i = 5; i < 10; i++)
         {
             /*
-             * Tell the main loop that ACK reception is complete.
+             * Make sure character is a digit.
              */
-            ack_received = 1;
-            uart_state = UART_WAIT_SEND_IMG;
-            HAL_UART_Receive_IT(&huart6, snd_status,10);
-        }
-        else if(uart_state == UART_WAIT_SEND_IMG){
-        	snd_ack_received = 1;
+            if (packet_count_data[i] < '0' ||
+                packet_count_data[i] > '9')
+            {
+                total_packets = 0;
+                packet_count_received = 0;
 
+                HAL_UART_Receive_IT(
+                    &huart6,
+                    packet_count_data,
+                    PACKET_COUNT_DATA_SIZE
+                );
+
+                return;
+            }
+
+
+            total_packets =
+                (total_packets * 10) +
+                (packet_count_data[i] - '0');
         }
+
+
+        /*
+         * Validate packet count.
+         */
+        if (total_packets == 0 ||
+            total_packets > MAX_PACKET_COUNT)
+        {
+            total_packets = 0;
+            packet_count_received = 0;
+
+            HAL_UART_Receive_IT(
+                &huart6,
+                packet_count_data,
+                PACKET_COUNT_DATA_SIZE
+            );
+
+            return;
+        }
+
+
+        /*
+         * Packet count is valid.
+         */
+        packet_count_received = 1;
     }
 }
 
+
+/* =========================================================
+ * UART ERROR CALLBACK
+ * ========================================================= */
+
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == USART6)
+    if (huart->Instance != USART6)
     {
-        /*
-         * Error while waiting for UTC.
-         */
-        if (uart_state == UART_STATE_WAIT_UTC)
-        {
-            HAL_UART_Receive_IT(&huart6,
-                                utc_data,
-                                UTC_DATA_SIZE);
-
-        }
+        return;
+    }
 
 
-        /*
-         * Error while waiting for final ACK.
-         */
-        else if (uart_state == UART_STATE_WAIT_PROCESS_ACK)
-        {
-            HAL_UART_Receive_IT(&huart6,
-                                ack_data,
-                                ACK_DATA_SIZE);
-        }
+    if (uart_state == UART_STATE_WAIT_UTC)
+    {
+        HAL_UART_Receive_IT(
+            &huart6,
+            utc_data,
+            UTC_DATA_SIZE
+        );
+    }
+
+
+    else if (uart_state == UART_STATE_WAIT_PROCESS_ACK)
+    {
+        HAL_UART_Receive_IT(
+            &huart6,
+            ack_data,
+            ACK_DATA_SIZE
+        );
+    }
+
+
+    else if (uart_state == UART_WAIT_SEND_IMG)
+    {
+        HAL_UART_Receive_IT(
+            &huart6,
+            packet_count_data,
+            PACKET_COUNT_DATA_SIZE
+        );
     }
 }
 
@@ -217,16 +457,19 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
-
+/* =========================================================
+ * CRC-16-CCITT
+ * ========================================================= */
 
 uint16_t crc16_ccitt(const uint8_t *data, uint32_t length)
 {
     uint16_t crc = 0xFFFF;
 
+
     for (uint32_t i = 0; i < length; i++)
     {
         crc ^= ((uint16_t)data[i] << 8);
+
 
         for (uint8_t j = 0; j < 8; j++)
         {
@@ -240,6 +483,7 @@ uint16_t crc16_ccitt(const uint8_t *data, uint32_t length)
             }
         }
     }
+
 
     return crc;
 }
@@ -280,8 +524,16 @@ int main(void)
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
 
+  /* =========================================================
+   * SD CARD INITIALIZATION TEST
+   * ========================================================= */
+
   HAL_Delay(500);
 
+
+  /*
+   * Tell PC that SD test is starting.
+   */
   HAL_UART_Transmit(
       &huart3,
       (uint8_t *)"STARTING SD TEST\r\n",
@@ -289,8 +541,16 @@ int main(void)
       HAL_MAX_DELAY
   );
 
+
+  /*
+   * Initialize SD card.
+   */
   uint8_t sd_status = SD_Init();
 
+
+  /*
+   * Print SD initialization result.
+   */
   char sd_msg[80];
 
   int sd_len = sprintf(
@@ -303,20 +563,43 @@ int main(void)
       &huart3,
       (uint8_t *)sd_msg,
       sd_len,
-      HAL_MAX_DELAY);
+      HAL_MAX_DELAY
+  );
 
-HAL_Delay(300);
-HAL_UART_Transmit(&huart6,
-                  capture_cmd,
-                  sizeof(capture_cmd) - 1,
-                  HAL_MAX_DELAY);
 
-uart_state = UART_STATE_WAIT_UTC;
+  HAL_Delay(300);
 
-   HAL_UART_Receive_IT(&huart6,
-                       utc_data,
-                       UTC_DATA_SIZE);
 
+  /* =========================================================
+   * START IMAGE CAPTURE / PROCESSING SEQUENCE
+   * ========================================================= */
+
+
+  /*
+   * Tell Raspberry Pi to capture/process image.
+   */
+  HAL_UART_Transmit(
+      &huart6,
+      capture_cmd,
+      sizeof(capture_cmd) - 1,
+      HAL_MAX_DELAY
+  );
+
+
+  /*
+   * We are now waiting for UTC folder name.
+   */
+  uart_state = UART_STATE_WAIT_UTC;
+
+
+  /*
+   * Start interrupt-based UTC reception.
+   */
+  HAL_UART_Receive_IT(
+      &huart6,
+      utc_data,
+      UTC_DATA_SIZE
+  );
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -326,511 +609,633 @@ uart_state = UART_STATE_WAIT_UTC;
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
-
-	  if(snd_ack_received){
-//		 flag_to_delete = 1;
-	    FRESULT fres;
-	    UINT bytes_written;
-
-	    uint8_t packet_buffer[PACKET_SIZE];
-
-	    uint8_t transfer_ok = 1;
-
 	    /*
-	     * ------------------------------------------------------------
-	     * MOUNT FILESYSTEM
-	     * ------------------------------------------------------------
-	     */
-
-	    fres = f_mount(&USERFatFS, USERPath, 1);
-
-	    if (fres != FR_OK)
-	    {
-	        char msg[80];
-
-	        int len = sprintf(
-	            msg,
-	            "FATFS MOUNT ERROR: %d\r\n",
-	            fres
-	        );
-
-	        HAL_UART_Transmit(
-	            &huart3,
-	            (uint8_t *)msg,
-	            len,
-	            HAL_MAX_DELAY
-	        );
-
-	        break;
-	    }
-
-	    HAL_UART_Transmit(
-	        &huart3,
-	        (uint8_t *)"FATFS MOUNT OK\r\n",
-	        strlen("FATFS MOUNT OK\r\n"),
-	        HAL_MAX_DELAY
-	    );
-
-
-	    /*
-	     * ------------------------------------------------------------
-	     * OPEN image.bin
+	     * =========================================================
+	     * WAIT FOR PACKET COUNT
+	     * =========================================================
 	     *
-	     * The file remains open for the entire transfer.
-	     * Each packet payload is appended to the file.
-	     * ------------------------------------------------------------
+	     * RPi sends:
+	     *
+	     * COUNT00010
+	     * COUNT00125
+	     * COUNT01000
+	     *
+	     * Exactly 10 bytes.
 	     */
 
-	    fres = f_open(
-	        &USERFile,
-	        "image.bin",
-	        FA_CREATE_ALWAYS | FA_WRITE
-	    );
-
-	    if (fres != FR_OK)
+	    if (packet_count_received)
 	    {
-	        char msg[80];
-
-	        int len = sprintf(
-	            msg,
-	            "image.bin OPEN ERROR: %d\r\n",
-	            fres
-	        );
+	        packet_count_received = 0;
 
 	        HAL_UART_Transmit(
 	            &huart3,
-	            (uint8_t *)msg,
-	            len,
+	            (uint8_t *)"STEP 1: PACKET COUNT RECEIVED\r\n",
+	            strlen("STEP 1: PACKET COUNT RECEIVED\r\n"),
 	            HAL_MAX_DELAY
 	        );
-
-	        break;
-	    }
-
-	    HAL_UART_Transmit(
-	        &huart3,
-	        (uint8_t *)"image.bin OPEN OK\r\n",
-	        strlen("image.bin OPEN OK\r\n"),
-	        HAL_MAX_DELAY
-	    );
-
-
-	    /*
-	     * ------------------------------------------------------------
-	     * TELL RPi TO START IMAGE TRANSFER
-	     * ------------------------------------------------------------
-	     */
-
-	    uint8_t tx_msg[] = "SEND IMAGE\r\n";
-
-	    HAL_UART_Transmit(
-	        &huart6,
-	        tx_msg,
-	        sizeof(tx_msg) - 1,
-	        HAL_MAX_DELAY
-	    );
-
-	    HAL_UART_Transmit(
-	        &huart3,
-	        (uint8_t *)"UART2 TX: SEND IMAGE\r\n",
-	        strlen("UART2 TX: SEND IMAGE\r\n"),
-	        HAL_MAX_DELAY
-	    );
-
-
-	    /*
-	     * ------------------------------------------------------------
-	     * RECEIVE PACKETS 0 TO 9
-	     * ------------------------------------------------------------
-	     */
-
-	    for (uint32_t expected_packet_id = 0;
-	         expected_packet_id < 10;
-	         expected_packet_id++)
-	    {
-	        uint8_t ready_msg[] = "SPI READY\r\n";
 
 	        /*
-	         * --------------------------------------------------------
-	         * TELL RPi THAT STM32 IS READY FOR THIS PACKET
-	         * --------------------------------------------------------
+	         * -----------------------------------------------------
+	         * PRINT TOTAL PACKET COUNT
+	         * -----------------------------------------------------
 	         */
+
+	        char count_msg[100];
+
+	        int count_len = sprintf(
+	            count_msg,
+	            "\r\nTOTAL PACKETS: %lu\r\n",
+	            total_packets
+	        );
+
+	        HAL_UART_Transmit(
+	            &huart3,
+	            (uint8_t *)count_msg,
+	            count_len,
+	            HAL_MAX_DELAY
+	        );
+
+
+	        /*
+	         * -----------------------------------------------------
+	         * CHECK PACKET COUNT
+	         * -----------------------------------------------------
+	         */
+
+	        if (total_packets == 0 ||
+	            total_packets > MAX_PACKET_COUNT)
+	        {
+	            HAL_UART_Transmit(
+	                &huart3,
+	                (uint8_t *)"INVALID PACKET COUNT\r\n",
+	                strlen("INVALID PACKET COUNT\r\n"),
+	                HAL_MAX_DELAY
+	            );
+
+	            total_packets = 0;
+
+	            continue;
+	        }
+
+
+	        /*
+	         * -----------------------------------------------------
+	         * VARIABLES
+	         * -----------------------------------------------------
+	         */
+
+	        FRESULT fres;
+
+	        UINT bytes_written;
+
+	        uint8_t packet_buffer[PACKET_SIZE];
+
+	        uint8_t transfer_ok = 1;
+
+
+	        /*
+	         * -----------------------------------------------------
+	         * MOUNT FAT FILESYSTEM
+	         * -----------------------------------------------------
+	         */
+
+	        HAL_UART_Transmit(
+	            &huart3,
+	            (uint8_t *)"STEP 2: STARTING FATFS MOUNT\r\n",
+	            strlen("STEP 2: STARTING FATFS MOUNT\r\n"),
+	            HAL_MAX_DELAY
+	        );
+
+	        fres = f_mount(
+	            &USERFatFS,
+	            USERPath,
+	            1
+	        );
+
+	        HAL_UART_Transmit(
+	            &huart3,
+	            (uint8_t *)"STEP 3: FATFS MOUNT RETURNED\r\n",
+	            strlen("STEP 3: FATFS MOUNT RETURNED\r\n"),
+	            HAL_MAX_DELAY
+	        );
+
+	        if (fres != FR_OK)
+	        {
+	            char msg[80];
+
+	            int len = sprintf(
+	                msg,
+	                "FATFS MOUNT ERROR: %d\r\n",
+	                fres
+	            );
+
+	            HAL_UART_Transmit(
+	                &huart3,
+	                (uint8_t *)msg,
+	                len,
+	                HAL_MAX_DELAY
+	            );
+
+	            total_packets = 0;
+
+	            continue;
+	        }
+
+	        HAL_UART_Transmit(
+	            &huart3,
+	            (uint8_t *)"FATFS MOUNT OK\r\n",
+	            strlen("FATFS MOUNT OK\r\n"),
+	            HAL_MAX_DELAY
+	        );
+
+
+	        /*
+	         * -----------------------------------------------------
+	         * OPEN IMAGE FILE
+	         * -----------------------------------------------------
+	         */
+
+	        HAL_UART_Transmit(
+	            &huart3,
+	            (uint8_t *)"STEP 4: OPENING image.bin\r\n",
+	            strlen("STEP 4: OPENING image.bin\r\n"),
+	            HAL_MAX_DELAY
+	        );
+
+	        fres = f_open(
+	            &USERFile,
+	            "image.bin",
+	            FA_CREATE_ALWAYS | FA_WRITE
+	        );
+
+	        HAL_UART_Transmit(
+	            &huart3,
+	            (uint8_t *)"STEP 5: f_open RETURNED\r\n",
+	            strlen("STEP 5: f_open RETURNED\r\n"),
+	            HAL_MAX_DELAY
+	        );
+
+	        if (fres != FR_OK)
+	        {
+	            char msg[80];
+
+	            int len = sprintf(
+	                msg,
+	                "image.bin OPEN ERROR: %d\r\n",
+	                fres
+	            );
+
+	            HAL_UART_Transmit(
+	                &huart3,
+	                (uint8_t *)msg,
+	                len,
+	                HAL_MAX_DELAY
+	            );
+
+	            total_packets = 0;
+
+	            continue;
+	        }
+
+	        HAL_UART_Transmit(
+	            &huart3,
+	            (uint8_t *)"image.bin OPEN OK\r\n",
+	            strlen("image.bin OPEN OK\r\n"),
+	            HAL_MAX_DELAY
+	        );
+
+
+	        /*
+	         * -----------------------------------------------------
+	         * TELL RPI TO START SPI TRANSFER
+	         * -----------------------------------------------------
+	         */
+	        HAL_UART_Transmit(
+	            &huart3,
+	            (uint8_t *)"STEP 6: ABOUT TO SEND SEND IMAGE\r\n",
+	            strlen("STEP 6: ABOUT TO SEND SEND IMAGE\r\n"),
+	            HAL_MAX_DELAY
+	        );
+
+	        uint8_t tx_msg[] = "SEND IMAGE\r\n";
 
 	        HAL_UART_Transmit(
 	            &huart6,
-	            ready_msg,
-	            sizeof(ready_msg) - 1,
+	            tx_msg,
+	            sizeof(tx_msg) - 1,
 	            HAL_MAX_DELAY
-	        );
-
-	        /*
-	         * IMPORTANT:
-	         *
-	         * DO NOT PUT DEBUG UART TRANSMISSIONS HERE.
-	         *
-	         * SPI READY must be followed immediately by
-	         * HAL_SPI_Receive().
-	         */
-
-	        HAL_StatusTypeDef spi_status;
-
-	        spi_status = HAL_SPI_Receive(
-	            &hspi2,
-	            packet_buffer,
-	            PACKET_SIZE,
-	            5000
-	        );
-
-	        if (spi_status != HAL_OK)
-	        {
-	            uint32_t error = HAL_SPI_GetError(&hspi2);
-
-	            char error_msg[100];
-
-	            int len = sprintf(
-	                error_msg,
-	                "PACKET %lu SPI ERROR: 0x%08lX\r\n",
-	                expected_packet_id,
-	                error
-	            );
-
-	            HAL_UART_Transmit(
-	                &huart3,
-	                (uint8_t *)error_msg,
-	                len,
-	                HAL_MAX_DELAY
-	            );
-
-	            transfer_ok = 0;
-
-	            break;
-	        }
-
-
-	        /*
-	         * --------------------------------------------------------
-	         * PARSE PACKET
-	         * --------------------------------------------------------
-	         */
-
-	        uint16_t sync =
-	            ((uint16_t)packet_buffer[0] << 8) |
-	            packet_buffer[1];
-
-	        uint32_t packet_id =
-	            ((uint32_t)packet_buffer[2] << 24) |
-	            ((uint32_t)packet_buffer[3] << 16) |
-	            ((uint32_t)packet_buffer[4] << 8) |
-	            packet_buffer[5];
-
-	        uint16_t payload_length =
-	            ((uint16_t)packet_buffer[6] << 8) |
-	            packet_buffer[7];
-
-	        uint16_t received_crc =
-	            ((uint16_t)packet_buffer[8] << 8) |
-	            packet_buffer[9];
-
-
-	        /*
-	         * --------------------------------------------------------
-	         * VALIDATE PAYLOAD LENGTH BEFORE COPYING
-	         *
-	         * Maximum payload = 200 bytes.
-	         * --------------------------------------------------------
-	         */
-
-	        if (payload_length > 200)
-	        {
-	            char error_msg[100];
-
-	            int len = sprintf(
-	                error_msg,
-	                "PACKET %lu INVALID LENGTH: %u\r\n",
-	                expected_packet_id,
-	                payload_length
-	            );
-
-	            HAL_UART_Transmit(
-	                &huart3,
-	                (uint8_t *)error_msg,
-	                len,
-	                HAL_MAX_DELAY
-	            );
-
-	            transfer_ok = 0;
-
-	            break;
-	        }
-
-
-	        /*
-	         * --------------------------------------------------------
-	         * CALCULATE CRC
-	         *
-	         * CRC covers:
-	         *
-	         *   SYNC
-	         *   PACKET ID
-	         *   LENGTH
-	         *   PAYLOAD
-	         *
-	         * CRC field itself is NOT included.
-	         * --------------------------------------------------------
-	         */
-
-	        uint8_t crc_buffer[208];
-
-	        memcpy(
-	            crc_buffer,
-	            packet_buffer,
-	            8
-	        );
-
-	        memcpy(
-	            &crc_buffer[8],
-	            &packet_buffer[10],
-	            payload_length
-	        );
-
-	        uint16_t calculated_crc =
-	            crc16_ccitt(
-	                crc_buffer,
-	                8 + payload_length
-	            );
-
-
-	        /*
-	         * --------------------------------------------------------
-	         * PRINT PACKET INFORMATION
-	         * --------------------------------------------------------
-	         */
-
-	        char msg[200];
-
-	        snprintf(
-	            msg,
-	            sizeof(msg),
-	            "\r\nPACKET ID: %lu\r\n"
-	            "EXPECTED ID: %lu\r\n"
-	            "SYNC: 0x%04X\r\n"
-	            "PAYLOAD LENGTH: %u\r\n"
-	            "RECEIVED CRC: 0x%04X\r\n"
-	            "CALCULATED CRC: 0x%04X\r\n",
-	            packet_id,
-	            expected_packet_id,
-	            sync,
-	            payload_length,
-	            received_crc,
-	            calculated_crc
 	        );
 
 	        HAL_UART_Transmit(
 	            &huart3,
-	            (uint8_t *)msg,
-	            strlen(msg),
+	            (uint8_t *)"STEP 7: SEND IMAGE SENT\r\n",
+	            strlen("STEP 7: SEND IMAGE SENT\r\n"),
 	            HAL_MAX_DELAY
 	        );
 
-
 	        /*
-	         * --------------------------------------------------------
-	         * VALIDATE PACKET
-	         * --------------------------------------------------------
+	         * =====================================================
+	         * RECEIVE ALL PACKETS
+	         * =====================================================
 	         */
 
-	        if (sync != 0xAA55 ||
-	            packet_id != expected_packet_id ||
-	            received_crc != calculated_crc)
+	        for (uint32_t expected_packet_id = 0;
+	             expected_packet_id < total_packets;
+	             expected_packet_id++)
 	        {
-	            char error_msg[120];
+	            /*
+	             * -------------------------------------------------
+	             * TELL RPI STM32 IS READY
+	             * -------------------------------------------------
+	             */
 
-	            int len = sprintf(
-	                error_msg,
-	                "PACKET %lu VALIDATION FAILED\r\n",
+	            uint8_t ready_msg[] = "SPI READY\r\n";
+
+	            HAL_UART_Transmit(
+	                &huart6,
+	                ready_msg,
+	                sizeof(ready_msg) - 1,
+	                HAL_MAX_DELAY
+	            );
+
+
+	            /*
+	             * -------------------------------------------------
+	             * RECEIVE 210 BYTE SPI PACKET
+	             * -------------------------------------------------
+	             */
+
+	            HAL_StatusTypeDef spi_status;
+
+	            spi_status = HAL_SPI_Receive(
+	                &hspi2,
+	                packet_buffer,
+	                PACKET_SIZE,
+	                5000
+	            );
+
+	            if (spi_status != HAL_OK)
+	            {
+	                uint32_t error =
+	                    HAL_SPI_GetError(&hspi2);
+
+	                char error_msg[120];
+
+	                int len = sprintf(
+	                    error_msg,
+	                    "PACKET %lu SPI ERROR: 0x%08lX\r\n",
+	                    expected_packet_id,
+	                    error
+	                );
+
+	                HAL_UART_Transmit(
+	                    &huart3,
+	                    (uint8_t *)error_msg,
+	                    len,
+	                    HAL_MAX_DELAY
+	                );
+
+	                transfer_ok = 0;
+
+	                break;
+	            }
+
+
+	            /*
+	             * -------------------------------------------------
+	             * READ PACKET HEADER
+	             * -------------------------------------------------
+	             */
+
+	            uint16_t sync =
+	                ((uint16_t)packet_buffer[0] << 8) |
+	                packet_buffer[1];
+
+
+	            uint32_t packet_id =
+	                ((uint32_t)packet_buffer[2] << 24) |
+	                ((uint32_t)packet_buffer[3] << 16) |
+	                ((uint32_t)packet_buffer[4] << 8) |
+	                packet_buffer[5];
+
+
+	            uint16_t payload_length =
+	                ((uint16_t)packet_buffer[6] << 8) |
+	                packet_buffer[7];
+
+
+	            uint16_t received_crc =
+	                ((uint16_t)packet_buffer[8] << 8) |
+	                packet_buffer[9];
+
+
+	            /*
+	             * -------------------------------------------------
+	             * CHECK PAYLOAD LENGTH
+	             * -------------------------------------------------
+	             */
+
+	            if (payload_length > 200)
+	            {
+	                char error_msg[120];
+
+	                int len = sprintf(
+	                    error_msg,
+	                    "PACKET %lu INVALID LENGTH: %u\r\n",
+	                    expected_packet_id,
+	                    payload_length
+	                );
+
+	                HAL_UART_Transmit(
+	                    &huart3,
+	                    (uint8_t *)error_msg,
+	                    len,
+	                    HAL_MAX_DELAY
+	                );
+
+	                transfer_ok = 0;
+
+	                break;
+	            }
+
+
+	            /*
+	             * -------------------------------------------------
+	             * CRC
+	             * -------------------------------------------------
+	             */
+
+	            uint8_t crc_buffer[208];
+
+	            memcpy(
+	                crc_buffer,
+	                packet_buffer,
+	                8
+	            );
+
+	            memcpy(
+	                &crc_buffer[8],
+	                &packet_buffer[10],
+	                payload_length
+	            );
+
+	            uint16_t calculated_crc =
+	                crc16_ccitt(
+	                    crc_buffer,
+	                    8 + payload_length
+	                );
+
+
+	            /*
+	             * -------------------------------------------------
+	             * PRINT PACKET INFO
+	             * -------------------------------------------------
+	             */
+
+	            char msg[220];
+
+	            snprintf(
+	                msg,
+	                sizeof(msg),
+	                "\r\nPACKET ID: %lu\r\n"
+	                "EXPECTED ID: %lu\r\n"
+	                "SYNC: 0x%04X\r\n"
+	                "PAYLOAD LENGTH: %u\r\n"
+	                "RECEIVED CRC: 0x%04X\r\n"
+	                "CALCULATED CRC: 0x%04X\r\n",
+	                packet_id,
+	                expected_packet_id,
+	                sync,
+	                payload_length,
+	                received_crc,
+	                calculated_crc
+	            );
+
+	            HAL_UART_Transmit(
+	                &huart3,
+	                (uint8_t *)msg,
+	                strlen(msg),
+	                HAL_MAX_DELAY
+	            );
+
+
+	            /*
+	             * -------------------------------------------------
+	             * VALIDATE PACKET
+	             * -------------------------------------------------
+	             */
+
+	            if (sync != 0xAA55 ||
+	                packet_id != expected_packet_id ||
+	                received_crc != calculated_crc)
+	            {
+	                char error_msg[140];
+
+	                int len = sprintf(
+	                    error_msg,
+	                    "PACKET %lu VALIDATION FAILED\r\n",
+	                    expected_packet_id
+	                );
+
+	                HAL_UART_Transmit(
+	                    &huart3,
+	                    (uint8_t *)error_msg,
+	                    len,
+	                    HAL_MAX_DELAY
+	                );
+
+	                transfer_ok = 0;
+
+	                break;
+	            }
+
+
+	            /*
+	             * -------------------------------------------------
+	             * CRC OK
+	             * -------------------------------------------------
+	             */
+
+	            char crc_ok_msg[100];
+
+	            int crc_ok_len = sprintf(
+	                crc_ok_msg,
+	                "PACKET %lu CRC OK\r\n",
 	                expected_packet_id
 	            );
 
 	            HAL_UART_Transmit(
 	                &huart3,
-	                (uint8_t *)error_msg,
-	                len,
+	                (uint8_t *)crc_ok_msg,
+	                crc_ok_len,
 	                HAL_MAX_DELAY
 	            );
 
-	            transfer_ok = 0;
 
-	            break;
-	        }
+	            /*
+	             * -------------------------------------------------
+	             * WRITE PAYLOAD TO SD
+	             * -------------------------------------------------
+	             */
 
-
-	        /*
-	         * --------------------------------------------------------
-	         * CRC PASSED
-	         * --------------------------------------------------------
-	         */
-
-	        char crc_ok_msg[80];
-
-	        int crc_ok_len = sprintf(
-	            crc_ok_msg,
-	            "PACKET %lu CRC OK\r\n",
-	            expected_packet_id
-	        );
-
-	        HAL_UART_Transmit(
-	            &huart3,
-	            (uint8_t *)crc_ok_msg,
-	            crc_ok_len,
-	            HAL_MAX_DELAY
-	        );
+	            fres = f_write(
+	                &USERFile,
+	                &packet_buffer[10],
+	                payload_length,
+	                &bytes_written
+	            );
 
 
-	        /*
-	         * --------------------------------------------------------
-	         * WRITE PAYLOAD DIRECTLY TO microSD
-	         *
-	         * packet_buffer contains ONLY ONE packet.
-	         *
-	         * The complete image is NEVER stored in STM32 RAM.
-	         *
-	         * Only:
-	         *
-	         *     packet_buffer[10 ... 10+payload_length-1]
-	         *
-	         * is written to image.bin.
-	         * --------------------------------------------------------
-	         */
+	            if (fres != FR_OK ||
+	                bytes_written != payload_length)
+	            {
+	                char write_msg[140];
 
-	        fres = f_write(
-	            &USERFile,
-	            &packet_buffer[10],
-	            payload_length,
-	            &bytes_written
-	        );
+	                int len = sprintf(
+	                    write_msg,
+	                    "PACKET %lu WRITE ERROR: result=%d bytes=%u\r\n",
+	                    expected_packet_id,
+	                    fres,
+	                    bytes_written
+	                );
 
-	        if (fres != FR_OK ||
-	            bytes_written != payload_length)
-	        {
-	            char write_msg[120];
+	                HAL_UART_Transmit(
+	                    &huart3,
+	                    (uint8_t *)write_msg,
+	                    len,
+	                    HAL_MAX_DELAY
+	                );
 
-	            int len = sprintf(
-	                write_msg,
-	                "PACKET %lu WRITE ERROR: result=%d bytes=%u\r\n",
+	                transfer_ok = 0;
+
+	                break;
+	            }
+
+
+	            /*
+	             * -------------------------------------------------
+	             * WRITE SUCCESS
+	             * -------------------------------------------------
+	             */
+
+	            char write_ok_msg[120];
+
+	            int write_ok_len = sprintf(
+	                write_ok_msg,
+	                "PACKET %lu WRITE OK: %u BYTES\r\n",
 	                expected_packet_id,
-	                fres,
 	                bytes_written
 	            );
 
 	            HAL_UART_Transmit(
 	                &huart3,
-	                (uint8_t *)write_msg,
+	                (uint8_t *)write_ok_msg,
+	                write_ok_len,
+	                HAL_MAX_DELAY
+	            );
+	        }
+
+
+	        /*
+	         * =====================================================
+	         * CLOSE FILE
+	         * =====================================================
+	         */
+
+	        fres = f_close(&USERFile);
+
+	        if (fres == FR_OK)
+	        {
+	            HAL_UART_Transmit(
+	                &huart3,
+	                (uint8_t *)"image.bin CLOSE OK\r\n",
+	                strlen("image.bin CLOSE OK\r\n"),
+	                HAL_MAX_DELAY
+	            );
+	        }
+	        else
+	        {
+	            char close_msg[100];
+
+	            int len = sprintf(
+	                close_msg,
+	                "image.bin CLOSE ERROR: %d\r\n",
+	                fres
+	            );
+
+	            HAL_UART_Transmit(
+	                &huart3,
+	                (uint8_t *)close_msg,
 	                len,
 	                HAL_MAX_DELAY
 	            );
 
 	            transfer_ok = 0;
-
-	            break;
 	        }
 
 
 	        /*
-	         * --------------------------------------------------------
-	         * WRITE SUCCESS
-	         * --------------------------------------------------------
+	         * =====================================================
+	         * FINAL RESULT
+	         * =====================================================
 	         */
 
-	        char write_ok_msg[100];
+	        if (transfer_ok)
+	        {
+	            char complete_msg[140];
 
-	        int write_ok_len = sprintf(
-	            write_ok_msg,
-	            "PACKET %lu WRITE OK: %u BYTES\r\n",
-	            expected_packet_id,
-	            bytes_written
-	        );
+	            int complete_len = sprintf(
+	                complete_msg,
+	                "\r\n================================\r\n"
+	                "COMPLETE IMAGE RECEIVED\r\n"
+	                "TOTAL PACKETS: %lu\r\n"
+	                "PACKET RANGE: 0-%lu\r\n"
+	                "FILE: image.bin\r\n"
+	                "================================\r\n",
+	                total_packets,
+	                total_packets - 1
+	            );
 
-	        HAL_UART_Transmit(
-	            &huart3,
-	            (uint8_t *)write_ok_msg,
-	            write_ok_len,
-	            HAL_MAX_DELAY
-	        );
+	            HAL_UART_Transmit(
+	                &huart3,
+	                (uint8_t *)complete_msg,
+	                complete_len,
+	                HAL_MAX_DELAY
+	            );
+	        }
+	        else
+	        {
+	            HAL_UART_Transmit(
+	                &huart3,
+	                (uint8_t *)"COMPLETE IMAGE TRANSFER FAILED\r\n",
+	                strlen("COMPLETE IMAGE TRANSFER FAILED\r\n"),
+	                HAL_MAX_DELAY
+	            );
+	        }
+
+
+	        /*
+	         * -----------------------------------------------------
+	         * FINISHED
+	         * -----------------------------------------------------
+	         */
+
+	        total_packets = 0;
+
+	        uart_state = UART_STATE_DONE;
+
+	        /*
+	         * Stop main loop after one image.
+	         */
+	        break;
 	    }
 
+	    /* USER CODE END 3 */
+	  }
 
-	    /*
-	     * ------------------------------------------------------------
-	     * CLOSE image.bin
-	     * ------------------------------------------------------------
-	     */
+	  /* USER CODE END WHILE */
 
-	    fres = f_close(&USERFile);
-
-	    if (fres == FR_OK)
-	    {
-	        HAL_UART_Transmit(
-	            &huart3,
-	            (uint8_t *)"image.bin CLOSE OK\r\n",
-	            strlen("image.bin CLOSE OK\r\n"),
-	            HAL_MAX_DELAY
-	        );
-	    }
-	    else
-	    {
-	        char close_msg[80];
-
-	        int len = sprintf(
-	            close_msg,
-	            "image.bin CLOSE ERROR: %d\r\n",
-	            fres
-	        );
-
-	        HAL_UART_Transmit(
-	            &huart3,
-	            (uint8_t *)close_msg,
-	            len,
-	            HAL_MAX_DELAY
-	        );
-
-	        transfer_ok = 0;
-	    }
-
-
-	    /*
-	     * ------------------------------------------------------------
-	     * FINAL RESULT
-	     * ------------------------------------------------------------
-	     */
-
-	    if (transfer_ok)
-	    {
-	        HAL_UART_Transmit(
-	            &huart3,
-	            (uint8_t *)"PACKETS 0-9 TEST COMPLETE\r\n",
-	            strlen("PACKETS 0-9 TEST COMPLETE\r\n"),
-	            HAL_MAX_DELAY
-	        );
-	    }
-	    else
-	    {
-	        HAL_UART_Transmit(
-	            &huart3,
-	            (uint8_t *)"PACKETS 0-9 TEST FAILED\r\n",
-	            strlen("PACKETS 0-9 TEST FAILED\r\n"),
-	            HAL_MAX_DELAY
-	        );
-	    }
-
-	    break;
-  }
-
-  }
-
-}
-  /* USER CODE END 3 */
-
+	}   /* <-- closes main() */
 
 /**
   * @brief System Clock Configuration

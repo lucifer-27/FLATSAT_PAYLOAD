@@ -4,6 +4,7 @@ CORTEX_M7.CPU_ICache=Disabled
 CORTEX_M7.IPParameters=CPU_ICache,CPU_DCache,MPU_Control
 CORTEX_M7.MPU_Control=__NULL
 File.Version=6
+GPIO.groupedBy=Group By Peripherals
 KeepUserPlacement=false
 Mcu.CPN=STM32H753ZIT6
 Mcu.Family=STM32H7
